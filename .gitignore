@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Training outputs
+runs/
+checkpoints/
+*.pth
+*.pt
+wandb/
+
+# Data
+data/
+*.tif
+*.tiff
+!tests/fixtures/**/*.tif
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
