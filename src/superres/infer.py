@@ -4,6 +4,9 @@ Loads one trained model per RGB pair, tiles the input scene with overlap,
 runs each model, stitches with Hann-window blending to suppress tile seams,
 then writes a GeoTIFF on the upscaled grid.
 
+For TOAR scenes the per-band reflectance coefficient is read from the Planet
+``<stem>_metadata.xml`` sidecar; for SR scenes pass ``--product sr``.
+
 Usage:
     python -m superres.infer \\
         --scene path/to/8band.tif \\
@@ -21,8 +24,9 @@ import numpy as np
 import rasterio
 import torch
 
-from .bands import DEFAULT_PAIRS, RED_EDGE_PAIRS, BandPair, SUPERDOVE_BAND_INDEX
+from .bands import DEFAULT_PAIRS, RED_EDGE_PAIRS, BandPair
 from .io import scaled_transform, write_rgb_geotiff
+from .metadata import SceneCalibration, resolve_calibration
 from .model import build_default_model
 from .registration import coarse_align
 
@@ -40,12 +44,14 @@ def _load_model(ckpt_path: Path, device: torch.device, scale: int) -> torch.nn.M
     return model
 
 
-def _read_scene_bands(scene_path: Path, pair: BandPair, scale_factor: float) -> np.ndarray:
+def _read_scene_bands(
+    scene_path: Path, pair: BandPair, calibration: SceneCalibration
+) -> np.ndarray:
     ia, ib = pair.indices()
     with rasterio.open(scene_path) as src:
-        a = src.read(ia).astype(np.float32)
-        b = src.read(ib).astype(np.float32)
-    return np.stack([a, b], axis=0) / scale_factor
+        a = src.read(ia).astype(np.float32) * calibration.coefficient(ia)
+        b = src.read(ib).astype(np.float32) * calibration.coefficient(ib)
+    return np.stack([a, b], axis=0)
 
 
 def _tile_infer(
@@ -76,7 +82,6 @@ def _tile_infer(
         for y in ys:
             for x in xs:
                 chip = pair_arr[:, y : y + tile, x : x + tile]
-                # Pad if at the edge (shouldn't happen given ys/xs above, but safe)
                 if chip.shape[1] != tile or chip.shape[2] != tile:
                     pad_h = tile - chip.shape[1]
                     pad_w = tile - chip.shape[2]
@@ -98,9 +103,7 @@ def _histogram_match(src: np.ndarray, ref: np.ndarray) -> np.ndarray:
         s = src[c].ravel()
         r = ref[c].ravel()
         s_sorted_idx = np.argsort(s)
-        s_sorted = s[s_sorted_idx]
         r_sorted = np.sort(r)
-        # Map s percentiles to r percentiles by interp
         new_vals = np.interp(
             np.linspace(0, 1, s.size),
             np.linspace(0, 1, r_sorted.size),
@@ -116,17 +119,20 @@ def infer(
     scene_path: Path,
     ckpts: dict[str, Path],
     out_path: Path,
+    product: str = "toar",
     use_red_edge: bool = False,
     scale: int = 2,
     tile: int = 256,
     overlap: int = 32,
-    scale_factor: float = 10000.0,
+    output_scale: float = 10000.0,
     align: bool = True,
     color_match: bool = True,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
     dev = torch.device(device)
     pairs = RED_EDGE_PAIRS if use_red_edge else DEFAULT_PAIRS
+    calibration = resolve_calibration(scene_path, product=product)
+    print(f"[scene] calibration: {calibration.reflectance_coefficients}")
 
     with rasterio.open(scene_path) as src:
         transform = src.transform
@@ -137,7 +143,7 @@ def infer(
     for pair in pairs:
         if pair.name not in ckpts:
             raise ValueError(f"missing checkpoint for {pair.name!r}")
-        pair_arr = _read_scene_bands(scene_path, pair, scale_factor)
+        pair_arr = _read_scene_bands(scene_path, pair, calibration)
         if align:
             pair_arr, residual = coarse_align(pair_arr)
             print(f"[{pair.name}] residual sub-pixel offset: {residual}")
@@ -153,12 +159,11 @@ def infer(
     rgb = np.stack(rgb_channels, axis=0).clip(0, None)
     if color_match:
         naive_rgb = np.stack(naive_rgb_channels, axis=0)
-        # Upsample naive RGB to SR grid for reference distribution (nearest is fine)
         ref = np.repeat(np.repeat(naive_rgb, scale, axis=1), scale, axis=2)
         rgb = _histogram_match(rgb, ref)
 
     sr_transform = scaled_transform(transform, scale)
-    write_rgb_geotiff(out_path, rgb, sr_transform, crs, scale_factor=scale_factor)
+    write_rgb_geotiff(out_path, rgb, sr_transform, crs, output_scale=output_scale)
     print(f"wrote {out_path} ({rgb.shape[1]}x{rgb.shape[2]})")
 
 
@@ -169,10 +174,15 @@ def main() -> None:
     ap.add_argument("--green", required=True, type=Path)
     ap.add_argument("--red", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument(
+        "--product", default="toar", choices=["toar", "sr"],
+        help="toar reads the Planet XML sidecar; sr uses the 1/10000 SR scale",
+    )
     ap.add_argument("--red-edge", action="store_true", help="use Red+RedEdge instead of Red+Yellow")
     ap.add_argument("--scale", type=int, default=2)
     ap.add_argument("--tile", type=int, default=256)
     ap.add_argument("--overlap", type=int, default=32)
+    ap.add_argument("--output-scale", type=float, default=10000.0)
     ap.add_argument("--no-align", action="store_true")
     ap.add_argument("--no-color-match", action="store_true")
     args = ap.parse_args()
@@ -181,10 +191,12 @@ def main() -> None:
         scene_path=args.scene,
         ckpts={"blue": args.blue, "green": args.green, "red": args.red},
         out_path=args.out,
+        product=args.product,
         use_red_edge=args.red_edge,
         scale=args.scale,
         tile=args.tile,
         overlap=args.overlap,
+        output_scale=args.output_scale,
         align=not args.no_align,
         color_match=not args.no_color_match,
     )

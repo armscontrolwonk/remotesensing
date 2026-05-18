@@ -33,6 +33,13 @@ toward magenta/orange.
   per-pixel average of the two source bands at native resolution. Random
   sub-pixel jitter is applied to one band of the LR input each sample so the
   network learns to use inter-band offsets at inference time.
+- **Radiometric handling:** for Analytic Radiance (TOAR) products, per-band
+  ``reflectanceCoefficient`` values are parsed from the Planet
+  ``<stem>_metadata.xml`` sidecar and applied on read, so the network always
+  sees data in a uniform TOA-reflectance [0, 1] frame regardless of
+  acquisition geometry. Set ``product: sr`` in the config if you're using
+  Surface Reflectance products instead — those use the constant 1/10000
+  scaling and don't need an XML sidecar.
 - **Loss:** L1 + LPIPS (perceptual). LPIPS is what buys the visual sharpness;
   pure L1 produces soft output.
 - **Inference:** tile-based with Hann-window blending to suppress seams; an
@@ -76,12 +83,13 @@ tests/test_smoke.py
 pip install -e .
 
 # Put your 8-band SuperDove scenes under data/superdove/*.tif
-# Edit configs/default.yaml if needed (chip size, batch size, etc.)
+# Each scene needs its <stem>_metadata.xml sidecar alongside it (Planet ships
+# this by default). Edit configs/default.yaml if you have SR products instead.
 
 # Train all three models (CPU-runnable for smoke tests, GPU for real)
 bash scripts/train_all.sh configs/default.yaml
 
-# Inference
+# Inference (TOAR is the default; pass --product sr for Surface Reflectance)
 python -m superres.infer \
     --scene data/superdove/AOI_0001.tif \
     --blue checkpoints/blue/best.pt \
@@ -89,6 +97,16 @@ python -m superres.infer \
     --red checkpoints/red/best.pt \
     --out out_rgb.tif
 ```
+
+## Which Planet product to order
+
+From Planet's order builder, pick **Analytic Radiance (TOAR) – 8 band**. The
+Surface Reflectance 8-band variant goes through atmospheric correction and
+additional resampling, both of which smear out the sub-pixel inter-band
+offsets this pipeline depends on. TOAR is closer to raw — fewer processing
+steps between the detector and the file — so band-to-band geometry is better
+preserved. (If you have API access to the L1B Basic Scene product, that's
+even more raw.)
 
 ## Tests
 

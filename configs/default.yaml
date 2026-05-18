@@ -14,7 +14,7 @@ use_red_edge: false                 # true → red channel uses Red+RedEdge inst
 wald:
   chip_size: 128
   scale: 2
-  scale_factor: 10000.0
+  product: toar                     # "toar" parses XML sidecar per scene; "sr" uses 1/10000
   blur_sigma: 1.0
   max_subpixel_jitter: 0.5          # simulate inter-band offset that survives L1B
   chips_per_scene: 64

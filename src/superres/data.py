@@ -7,6 +7,11 @@ target is the *average* of those two bands at native resolution. Training on
 the average pushes the network toward a fused output rather than just one of
 the two source bands.
 
+Each scene's per-band reflectance coefficients are loaded from its Planet
+XML sidecar (``product="toar"``) or assumed to be 1/10000 (``product="sr"``),
+so all chips reach the network in a uniform TOA-reflectance [0, 1] frame
+regardless of scene acquisition geometry.
+
 Important: we simulate the real-world per-band sub-pixel offset by jittering
 band B relative to band A with a small random shift each sample. Without this
 the network only ever sees perfectly co-registered pairs at training time and
@@ -25,13 +30,14 @@ from scipy.ndimage import gaussian_filter, shift as nd_shift
 from torch.utils.data import Dataset
 
 from .bands import BandPair, SUPERDOVE_BAND_INDEX
+from .metadata import SceneCalibration, resolve_calibration
 
 
 @dataclass
 class WaldConfig:
     chip_size: int = 128  # HR chip size in pixels
     scale: int = 2
-    scale_factor: float = 10000.0
+    product: str = "toar"  # "toar" parses XML sidecar; "sr" uses 1/10000
     blur_sigma: float = 1.0  # Gaussian sigma applied before downsampling
     max_subpixel_jitter: float = 0.5  # ± fraction of a pixel for band B
     chips_per_scene: int = 64
@@ -57,6 +63,11 @@ class SuperDoveWaldDataset(Dataset):
         self.index_map = index_map
         self.rng = random.Random(seed)
         self._scene_dims = self._index_scene_dims()
+        # Eagerly resolve per-scene calibration so multi-worker DataLoaders
+        # don't each re-parse XML on every worker process.
+        self._calibrations: list[SceneCalibration] = [
+            resolve_calibration(p, product=self.cfg.product) for p in self.scene_paths
+        ]
 
     def _index_scene_dims(self) -> list[tuple[int, int]]:
         dims = []
@@ -79,10 +90,11 @@ class SuperDoveWaldDataset(Dataset):
 
     def _read_pair(self, scene_idx: int, window: Window) -> np.ndarray:
         ia, ib = self.pair.indices(self.index_map)
+        cal = self._calibrations[scene_idx]
         with rasterio.open(self.scene_paths[scene_idx]) as src:
-            a = src.read(ia, window=window).astype(np.float32)
-            b = src.read(ib, window=window).astype(np.float32)
-        return np.stack([a, b], axis=0) / self.cfg.scale_factor
+            a = src.read(ia, window=window).astype(np.float32) * cal.coefficient(ia)
+            b = src.read(ib, window=window).astype(np.float32) * cal.coefficient(ib)
+        return np.stack([a, b], axis=0)
 
     def _degrade(self, hr_pair: np.ndarray) -> np.ndarray:
         """Wald's protocol: blur + decimate, with per-band jitter on band B."""
